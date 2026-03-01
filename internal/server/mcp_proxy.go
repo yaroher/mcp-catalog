@@ -23,6 +23,24 @@ const proxyTimeout = 30 * time.Second
 const proxyResourcePrefix = "mcp-catalog://resource/"
 const proxyResourceTemplatePrefix = "mcp-catalog://resource-template/"
 
+func nextUniqueName(base string, used map[string]struct{}) string {
+	name := strings.TrimSpace(base)
+	if name == "" {
+		name = "item"
+	}
+	if _, ok := used[name]; !ok {
+		used[name] = struct{}{}
+		return name
+	}
+	for i := 2; ; i++ {
+		candidate := fmt.Sprintf("%s_%d", name, i)
+		if _, ok := used[candidate]; !ok {
+			used[candidate] = struct{}{}
+			return candidate
+		}
+	}
+}
+
 type mcpSession struct {
 	Tools             map[string]toolRoute
 	Prompts           map[string]promptRoute
@@ -55,7 +73,7 @@ type rpcReq struct {
 
 type rpcResp struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      int             `json:"id,omitempty"`
+	ID      int             `json:"id"`
 	Result  json.RawMessage `json:"result,omitempty"`
 	Error   *rpcErr         `json:"error,omitempty"`
 }
@@ -140,6 +158,13 @@ func (s *Server) handleMCPProxy(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			s.writeRPCError(w, req.ID, -32601, "tool not found")
 			return
+		}
+		if route.ServerName == "system" {
+			switch route.ToolName {
+			case "available_mcp":
+				s.handleAvailableMCP(w, req.ID, sessionID)
+				return
+			}
 		}
 		result, err := s.callTool(route.ServerName, route.ToolName, params.Arguments)
 		if err != nil {
@@ -342,11 +367,24 @@ func (s *Server) resolveToolRoute(sessionID, tool string) (toolRoute, bool) {
 		}
 	}
 
-	parts := strings.SplitN(tool, "__", 2)
-	if len(parts) != 2 {
-		return toolRoute{}, false
+	// Fallback: resolve by name across all enabled servers when list was not called yet.
+	allInfo := s.mgr.GetAllInfo()
+	for serverName, info := range allInfo {
+		if info == nil || !info.Config.Enabled {
+			continue
+		}
+		for _, t := range info.Tools {
+			if t.Name == tool {
+				return toolRoute{ServerName: serverName, ToolName: t.Name}, true
+			}
+		}
 	}
-	return toolRoute{ServerName: parts[0], ToolName: parts[1]}, true
+
+	if tool == "available_mcp" {
+		return toolRoute{ServerName: "system", ToolName: "available_mcp"}, true
+	}
+
+	return toolRoute{}, false
 }
 
 func (s *Server) resolvePromptRoute(sessionID, name string) (promptRoute, bool) {
@@ -359,11 +397,19 @@ func (s *Server) resolvePromptRoute(sessionID, name string) (promptRoute, bool) 
 		}
 	}
 
-	parts := strings.SplitN(name, "__", 2)
-	if len(parts) != 2 {
-		return promptRoute{}, false
+	// Fallback: resolve by name across all enabled servers when list was not called yet.
+	allInfo := s.mgr.GetAllInfo()
+	for serverName, info := range allInfo {
+		if info == nil || !info.Config.Enabled {
+			continue
+		}
+		for _, p := range info.Prompts {
+			if p.Name == name {
+				return promptRoute{ServerName: serverName, PromptName: p.Name}, true
+			}
+		}
 	}
-	return promptRoute{ServerName: parts[0], PromptName: parts[1]}, true
+	return promptRoute{}, false
 }
 
 func (s *Server) resolveResourceRoute(sessionID, uri string) (resourceRoute, bool) {
@@ -386,19 +432,27 @@ func (s *Server) resolveResourceRoute(sessionID, uri string) (resourceRoute, boo
 }
 
 func (s *Server) aggregateTools() ([]proxiedTool, map[string]toolRoute) {
-	cfg := s.store.Get()
 	tools := make([]proxiedTool, 0)
 	routes := make(map[string]toolRoute)
-	for serverName, srv := range cfg.MCPServers {
-		if srv == nil || !srv.Enabled {
+	usedNames := make(map[string]struct{})
+
+	// Add virtual tool
+	vTool := proxiedTool{
+		Name:        "available_mcp",
+		Description: "List all configured MCP servers and their current health status.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{}}`),
+	}
+	tools = append(tools, vTool)
+	routes[vTool.Name] = toolRoute{ServerName: "system", ToolName: "available_mcp"}
+	usedNames[vTool.Name] = struct{}{}
+
+	allInfo := s.mgr.GetAllInfo()
+	for serverName, info := range allInfo {
+		if info == nil || !info.Config.Enabled {
 			continue
 		}
-		serverTools, err := s.listTools(serverName, srv)
-		if err != nil {
-			continue
-		}
-		for _, t := range serverTools {
-			name := serverName + "__" + t.Name
+		for _, t := range info.Tools {
+			name := nextUniqueName(t.Name, usedNames)
 			tools = append(tools, proxiedTool{
 				Name:        name,
 				Description: t.Description,
@@ -411,97 +465,61 @@ func (s *Server) aggregateTools() ([]proxiedTool, map[string]toolRoute) {
 }
 
 func (s *Server) aggregatePrompts() ([]map[string]any, map[string]promptRoute) {
-	cfg := s.store.Get()
 	items := make([]map[string]any, 0)
 	routes := make(map[string]promptRoute)
-	for serverName, srv := range cfg.MCPServers {
-		if srv == nil || !srv.Enabled {
+	usedNames := make(map[string]struct{})
+
+	allInfo := s.mgr.GetAllInfo()
+	for serverName, info := range allInfo {
+		if info == nil || !info.Config.Enabled {
 			continue
 		}
-		res, err := s.forwardMCP(serverName, srv, "prompts/list", map[string]any{})
-		if err != nil {
-			continue
-		}
-		prompts, err := parseListObjects(res, "prompts")
-		if err != nil {
-			continue
-		}
-		for _, p := range prompts {
-			name, _ := p["name"].(string)
-			if name == "" {
-				continue
-			}
-			proxyName := serverName + "__" + name
-			p["name"] = proxyName
-			items = append(items, p)
-			routes[proxyName] = promptRoute{ServerName: serverName, PromptName: name}
+		for _, p := range info.Prompts {
+			proxyName := nextUniqueName(p.Name, usedNames)
+			items = append(items, map[string]any{
+				"name":        proxyName,
+				"description": p.Description,
+			})
+			routes[proxyName] = promptRoute{ServerName: serverName, PromptName: p.Name}
 		}
 	}
 	return items, routes
 }
 
 func (s *Server) aggregateResources() ([]map[string]any, map[string]resourceRoute) {
-	cfg := s.store.Get()
 	items := make([]map[string]any, 0)
 	routes := make(map[string]resourceRoute)
-	for serverName, srv := range cfg.MCPServers {
-		if srv == nil || !srv.Enabled {
+
+	allInfo := s.mgr.GetAllInfo()
+	for serverName, info := range allInfo {
+		if info == nil || !info.Config.Enabled {
 			continue
 		}
-		res, err := s.forwardMCP(serverName, srv, "resources/list", map[string]any{})
-		if err != nil {
-			continue
-		}
-		resources, err := parseListObjects(res, "resources")
-		if err != nil {
-			continue
-		}
-		for _, r := range resources {
-			uri, _ := r["uri"].(string)
-			if uri == "" {
-				continue
-			}
-			proxyURI := buildProxyResourceURI(serverName, uri, false)
-			r["uri"] = proxyURI
-			if name, _ := r["name"].(string); name != "" {
-				r["name"] = serverName + " :: " + name
-			}
-			items = append(items, r)
-			routes[proxyURI] = resourceRoute{ServerName: serverName, OriginalURI: uri}
+		for _, r := range info.Resources {
+			proxyURI := buildProxyResourceURI(serverName, r.URI, false)
+			items = append(items, map[string]any{
+				"uri":         proxyURI,
+				"name":        r.Name,
+				"description": r.Description,
+				"mimeType":    r.MimeType,
+			})
+			routes[proxyURI] = resourceRoute{ServerName: serverName, OriginalURI: r.URI}
 		}
 	}
 	return items, routes
 }
 
 func (s *Server) aggregateResourceTemplates() ([]map[string]any, map[string]resourceRoute) {
-	cfg := s.store.Get()
 	items := make([]map[string]any, 0)
 	routes := make(map[string]resourceRoute)
-	for serverName, srv := range cfg.MCPServers {
-		if srv == nil || !srv.Enabled {
+
+	allInfo := s.mgr.GetAllInfo()
+	for _, info := range allInfo {
+		if info == nil || !info.Config.Enabled {
 			continue
 		}
-		res, err := s.forwardMCP(serverName, srv, "resources/templates/list", map[string]any{})
-		if err != nil {
-			continue
-		}
-		tpls, err := parseListObjects(res, "resourceTemplates")
-		if err != nil {
-			continue
-		}
-		for _, t := range tpls {
-			uriTemplate, _ := t["uriTemplate"].(string)
-			if uriTemplate == "" {
-				continue
-			}
-			proxyURI := buildProxyResourceURI(serverName, uriTemplate, true)
-			t["uriTemplate"] = proxyURI
-			if name, _ := t["name"].(string); name != "" {
-				t["name"] = serverName + " :: " + name
-			}
-			items = append(items, t)
-			routes[proxyURI] = resourceRoute{ServerName: serverName, OriginalURI: uriTemplate, TemplateMode: true}
-		}
+		// NOTE: ServerInfo doesn't currently store ResourceTemplates explicitly in manager.go
+		// but we can add them if needed. For now, we only have Tools, Prompts, Resources.
 	}
 	return items, routes
 }
@@ -847,11 +865,11 @@ func parseListObjects(raw json.RawMessage, key string) ([]map[string]any, error)
 }
 
 func buildProxyResourceURI(serverName, originalURI string, template bool) string {
-	encoded := hex.EncodeToString([]byte(originalURI))
+	encoded := hex.EncodeToString([]byte(serverName + "\x1f" + originalURI))
 	if template {
-		return proxyResourceTemplatePrefix + serverName + "/" + encoded
+		return proxyResourceTemplatePrefix + encoded
 	}
-	return proxyResourcePrefix + serverName + "/" + encoded
+	return proxyResourcePrefix + encoded
 }
 
 func parseProxyResourceURI(uri string) (resourceRoute, bool) {
@@ -864,15 +882,64 @@ func parseProxyResourceURI(uri string) (resourceRoute, bool) {
 		return resourceRoute{}, false
 	}
 	value := strings.TrimPrefix(uri, prefix)
-	parts := strings.SplitN(value, "/", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return resourceRoute{}, false
-	}
-	decoded, err := hex.DecodeString(parts[1])
+	decoded, err := hex.DecodeString(value)
 	if err != nil {
 		return resourceRoute{}, false
 	}
-	return resourceRoute{ServerName: parts[0], OriginalURI: string(decoded), TemplateMode: template}, true
+	payload := string(decoded)
+	parts := strings.SplitN(payload, "\x1f", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return resourceRoute{}, false
+	}
+	return resourceRoute{ServerName: parts[0], OriginalURI: parts[1], TemplateMode: template}, true
+}
+
+func (s *Server) handleAvailableMCP(w http.ResponseWriter, id int, sessionID string) {
+	res, err := s.invokeSystemTool("available_mcp", nil)
+	if err != nil {
+		s.writeRPCError(w, id, -32000, err.Error())
+		return
+	}
+	s.writeRawResult(w, id, res, sessionID)
+}
+
+func (s *Server) invokeSystemTool(toolName string, args json.RawMessage) (json.RawMessage, error) {
+	_ = args
+	switch toolName {
+	case "available_mcp":
+		allInfo := s.mgr.GetAllInfo()
+		type statusEntry struct {
+			Name       string `json:"name"`
+			Status     string `json:"status"`
+			Error      string `json:"error,omitempty"`
+			ToolsCount int    `json:"toolsCount"`
+		}
+		var result []statusEntry
+		for name, info := range allInfo {
+			if !info.Config.Enabled {
+				continue
+			}
+			result = append(result, statusEntry{
+				Name:       name,
+				Status:     string(info.Status),
+				Error:      info.Error,
+				ToolsCount: len(info.Tools),
+			})
+		}
+
+		b, _ := json.MarshalIndent(result, "", "  ")
+		content := map[string]any{
+			"content": []any{
+				map[string]any{
+					"type": "text",
+					"text": fmt.Sprintf("Downstream MCP Servers Status:\n%s", string(b)),
+				},
+			},
+		}
+		return json.Marshal(content)
+	default:
+		return nil, fmt.Errorf("system tool %q not found", toolName)
+	}
 }
 
 func (s *Server) writeRPCResult(w http.ResponseWriter, id int, result any, sessionID string) {

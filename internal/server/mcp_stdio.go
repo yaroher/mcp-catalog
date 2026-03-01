@@ -8,11 +8,19 @@ import (
 	"strings"
 
 	"github.com/naukograd-software/mcp-catalog/internal/config"
+	"github.com/naukograd-software/mcp-catalog/internal/manager"
 )
 
 // RunMCPStdio starts the MCP proxy transport over stdio.
 func RunMCPStdio(store *config.Store) error {
-	s := &Server{store: store}
+	mgr := manager.New(store)
+	go mgr.CheckAll()
+	go mgr.StartHealthLoop()
+
+	s := &Server{
+		store: store,
+		mgr:   mgr,
+	}
 	return s.runMCPStdio()
 }
 
@@ -87,7 +95,13 @@ func (s *Server) runMCPStdio() error {
 					continue
 				}
 			}
-			res, err := s.callTool(route.ServerName, route.ToolName, p.Arguments)
+			var res json.RawMessage
+			var err error
+			if route.ServerName == "system" {
+				res, err = s.invokeSystemTool(route.ToolName, p.Arguments)
+			} else {
+				res, err = s.callTool(route.ServerName, route.ToolName, p.Arguments)
+			}
 			if err != nil {
 				_ = write(rpcResp{JSONRPC: "2.0", ID: req.ID, Error: &rpcErr{Code: -32000, Message: err.Error()}})
 				continue
