@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -136,6 +137,33 @@ func (s *Server) handleMCPProxy(w http.ResponseWriter, r *http.Request) {
 			s.writeRPCError(w, req.ID, -32000, "missing or invalid MCP session")
 			return
 		}
+
+		// Use a context-based timeout loop instead of hardcoded 10 iterations.
+		// Return immediately once all servers are ready.
+		discoveryCtx, discoveryCancel := context.WithTimeout(r.Context(), 8*time.Second)
+		defer discoveryCancel()
+
+	pollLoop:
+		for {
+			allDone := true
+			allInfo := s.mgr.GetAllInfo()
+			for _, info := range allInfo {
+				if info.Config.Enabled && (info.Status == "unchecked" || info.Status == "checking") {
+					allDone = false
+					break
+				}
+			}
+			if allDone {
+				break pollLoop
+			}
+			select {
+			case <-discoveryCtx.Done():
+				break pollLoop
+			case <-time.After(200 * time.Millisecond):
+				// Poll faster
+			}
+		}
+
 		tools, routes := s.aggregateTools()
 		s.updateSessionTools(sessionID, routes)
 		s.writeRPCResult(w, req.ID, toolsListResult{Tools: tools}, sessionID)
@@ -160,17 +188,20 @@ func (s *Server) handleMCPProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if route.ServerName == "system" {
-			switch route.ToolName {
-			case "available_mcp":
-				s.handleAvailableMCP(w, req.ID, sessionID)
+			res, err := s.invokeSystemTool(route.ToolName, params.Arguments, sessionID)
+			if err != nil {
+				s.writeRPCError(w, req.ID, -32000, err.Error())
 				return
 			}
+			s.writeRawResult(w, req.ID, res, sessionID)
+			return
 		}
 		result, err := s.callTool(route.ServerName, route.ToolName, params.Arguments)
 		if err != nil {
 			s.writeRPCError(w, req.ID, -32000, err.Error())
 			return
 		}
+		
 		s.writeRawResult(w, req.ID, result, sessionID)
 		return
 	case "prompts/list":
@@ -436,23 +467,45 @@ func (s *Server) aggregateTools() ([]proxiedTool, map[string]toolRoute) {
 	routes := make(map[string]toolRoute)
 	usedNames := make(map[string]struct{})
 
-	// Add virtual tool
-	vTool := proxiedTool{
-		Name:        "available_mcp",
-		Description: "List all configured MCP servers and their current health status.",
-		InputSchema: json.RawMessage(`{"type":"object","properties":{}}`),
-	}
-	tools = append(tools, vTool)
-	routes[vTool.Name] = toolRoute{ServerName: "system", ToolName: "available_mcp"}
-	usedNames[vTool.Name] = struct{}{}
+	// Internal routes for system tools (NOT listed in tools/list)
+	routes["available_mcp"] = toolRoute{ServerName: "system", ToolName: "available_mcp"}
+	routes["describe_mcp"] = toolRoute{ServerName: "system", ToolName: "describe_mcp"}
 
 	allInfo := s.mgr.GetAllInfo()
-	for serverName, info := range allInfo {
+	serverNames := make([]string, 0, len(allInfo))
+	for n := range allInfo {
+		serverNames = append(serverNames, n)
+	}
+	sort.Strings(serverNames)
+
+	// Count occurrences of tool names
+	toolCounts := make(map[string]int)
+	for _, info := range allInfo {
 		if info == nil || !info.Config.Enabled {
 			continue
 		}
 		for _, t := range info.Tools {
-			name := nextUniqueName(t.Name, usedNames)
+			toolCounts[t.Name]++
+		}
+	}
+
+	for _, serverName := range serverNames {
+		info := allInfo[serverName]
+		if info == nil || !info.Config.Enabled {
+			continue
+		}
+		
+		for _, t := range info.Tools {
+			name := t.Name
+			// Only use server prefix if there's a conflict or tool is too generic
+			if toolCounts[t.Name] > 1 || strings.Contains(strings.ToLower(t.Name), "navigate") || strings.Contains(strings.ToLower(t.Name), "click") {
+				base := strings.TrimSuffix(serverName, "-mcp")
+				name = fmt.Sprintf("%s_%s", base, t.Name)
+			}
+			
+			// Ensure absolute uniqueness in the proxy
+			name = nextUniqueName(name, usedNames)
+			
 			tools = append(tools, proxiedTool{
 				Name:        name,
 				Description: t.Description,
@@ -470,7 +523,14 @@ func (s *Server) aggregatePrompts() ([]map[string]any, map[string]promptRoute) {
 	usedNames := make(map[string]struct{})
 
 	allInfo := s.mgr.GetAllInfo()
-	for serverName, info := range allInfo {
+	serverNames := make([]string, 0, len(allInfo))
+	for n := range allInfo {
+		serverNames = append(serverNames, n)
+	}
+	sort.Strings(serverNames)
+
+	for _, serverName := range serverNames {
+		info := allInfo[serverName]
 		if info == nil || !info.Config.Enabled {
 			continue
 		}
@@ -491,7 +551,14 @@ func (s *Server) aggregateResources() ([]map[string]any, map[string]resourceRout
 	routes := make(map[string]resourceRoute)
 
 	allInfo := s.mgr.GetAllInfo()
-	for serverName, info := range allInfo {
+	serverNames := make([]string, 0, len(allInfo))
+	for n := range allInfo {
+		serverNames = append(serverNames, n)
+	}
+	sort.Strings(serverNames)
+
+	for _, serverName := range serverNames {
+		info := allInfo[serverName]
 		if info == nil || !info.Config.Enabled {
 			continue
 		}
@@ -894,24 +961,13 @@ func parseProxyResourceURI(uri string) (resourceRoute, bool) {
 	return resourceRoute{ServerName: parts[0], OriginalURI: parts[1], TemplateMode: template}, true
 }
 
-func (s *Server) handleAvailableMCP(w http.ResponseWriter, id int, sessionID string) {
-	res, err := s.invokeSystemTool("available_mcp", nil)
-	if err != nil {
-		s.writeRPCError(w, id, -32000, err.Error())
-		return
-	}
-	s.writeRawResult(w, id, res, sessionID)
-}
-
-func (s *Server) invokeSystemTool(toolName string, args json.RawMessage) (json.RawMessage, error) {
-	_ = args
+func (s *Server) invokeSystemTool(toolName string, args json.RawMessage, sessionID string) (json.RawMessage, error) {
 	switch toolName {
 	case "available_mcp":
 		allInfo := s.mgr.GetAllInfo()
 		type statusEntry struct {
 			Name       string `json:"name"`
 			Status     string `json:"status"`
-			Error      string `json:"error,omitempty"`
 			ToolsCount int    `json:"toolsCount"`
 		}
 		var result []statusEntry
@@ -922,7 +978,6 @@ func (s *Server) invokeSystemTool(toolName string, args json.RawMessage) (json.R
 			result = append(result, statusEntry{
 				Name:       name,
 				Status:     string(info.Status),
-				Error:      info.Error,
 				ToolsCount: len(info.Tools),
 			})
 		}
@@ -932,14 +987,138 @@ func (s *Server) invokeSystemTool(toolName string, args json.RawMessage) (json.R
 			"content": []any{
 				map[string]any{
 					"type": "text",
-					"text": fmt.Sprintf("Downstream MCP Servers Status:\n%s", string(b)),
+					"text": fmt.Sprintf("Downstream MCP Servers Status:\n%s\n\nAll tools from these servers are integrated directly into this proxy. You can see them in 'tools/list'.", string(b)),
 				},
 			},
 		}
 		return json.Marshal(content)
+
+	case "describe_mcp":
+		var params struct {
+			ServerName string `json:"serverName"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return nil, fmt.Errorf("invalid describe_mcp params")
+		}
+		params.ServerName = strings.TrimSpace(params.ServerName)
+
+		info, ok := s.mgr.GetInfo(params.ServerName)
+		if !ok {
+			return nil, fmt.Errorf("server %q not found", params.ServerName)
+		}
+
+		// Ensure we have tools
+		if info.Status == "unchecked" || info.Status == "checking" {
+			if info.Status == "unchecked" {
+				_ = s.mgr.Check(params.ServerName)
+			} else {
+				for i := 0; i < 20; i++ {
+					time.Sleep(500 * time.Millisecond)
+					info, _ = s.mgr.GetInfo(params.ServerName)
+					if info.Status != "checking" {
+						break
+					}
+				}
+			}
+			info, _ = s.mgr.GetInfo(params.ServerName)
+		}
+
+		type toolMapping struct {
+			ProxiedName string `json:"proxiedName"`
+			Original    string `json:"original"`
+			Description string `json:"description,omitempty"`
+		}
+		tools := make([]toolMapping, 0)
+
+		if info.Status == "healthy" {
+			allInfo := s.mgr.GetAllInfo()
+			serverNames := make([]string, 0, len(allInfo))
+			for n := range allInfo {
+				serverNames = append(serverNames, n)
+			}
+			sort.Strings(serverNames)
+
+			usedNames := make(map[string]struct{})
+			usedNames["available_mcp"] = struct{}{}
+			usedNames["describe_mcp"] = struct{}{}
+
+			for _, sName := range serverNames {
+				sInfo := allInfo[sName]
+				if sInfo == nil || !sInfo.Config.Enabled {
+					continue
+				}
+				for _, t := range sInfo.Tools {
+					pName := nextUniqueName(t.Name, usedNames)
+					if strings.EqualFold(sName, params.ServerName) {
+						tools = append(tools, toolMapping{
+							ProxiedName: pName,
+							Original:    t.Name,
+							Description: t.Description,
+						})
+					}
+				}
+			}
+		}
+
+		header := fmt.Sprintf("SERVER: %s\nSTATUS: %s\n", params.ServerName, info.Status)
+		if info.Error != "" {
+			header += fmt.Sprintf("ERROR: %s\n", info.Error)
+			header += "\nFIX REQUIRED: The server is down. Do not try to call its tools.\n"
+		}
+
+		instruction := "\nNEXT STEP FOR AGENT: Find the 'proxiedName' for your task in the list below. Then, immediately execute it using tools/call on THIS proxy server. Do NOT search for resources or list_mcp_resources. CALL THE TOOL DIRECTLY.\n"
+
+		verificationHint := ""
+		if strings.Contains(strings.ToLower(params.ServerName), "chrome") {
+			verificationHint = "\nVERIFICATION HINT: After your action (e.g. navigation), confirm with 'get_windows_and_tabs'.\n"
+		}
+
+		footer := ""
+		if info.Status == "healthy" && len(tools) == 0 {
+			footer = "\nWARNING: No tools found for this server."
+		}
+
+		b, _ := json.MarshalIndent(tools, "", "  ")
+		content := map[string]any{
+			"content": []any{
+				map[string]any{
+					"type": "text",
+					"text": fmt.Sprintf("%s%s%s\nTOOLS MAPPING (CALL THESE NAMES DIRECTLY):\n%s%s", header, instruction, verificationHint, string(b), footer),
+				},
+			},
+		}
+		return json.Marshal(content)
+
 	default:
 		return nil, fmt.Errorf("system tool %q not found", toolName)
 	}
+}
+
+func (s *Server) enhanceToolResult(result json.RawMessage, serverName string) json.RawMessage {
+	if len(result) == 0 {
+		return result
+	}
+	var parsed struct {
+		Content []map[string]any `json:"content"`
+		IsError bool             `json:"isError,omitempty"`
+	}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		// Not a standard MCP tool result, return as is
+		return result
+	}
+
+	// Add a clear success indicator for agents
+	msg := fmt.Sprintf("[Proxy] Tool successfully executed on downstream server %q.", serverName)
+	parsed.Content = append(parsed.Content, map[string]any{
+		"type": "text",
+		"text": msg,
+	})
+
+	enhanced, err := json.Marshal(parsed)
+	if err != nil {
+		return result
+	}
+	return enhanced
 }
 
 func (s *Server) writeRPCResult(w http.ResponseWriter, id int, result any, sessionID string) {

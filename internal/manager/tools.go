@@ -1,13 +1,10 @@
 package manager
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"strings"
 )
 
 type CLITool struct {
@@ -18,10 +15,12 @@ type CLITool struct {
 	HasConfig   bool   `json:"hasConfig"`
 }
 
-type DiffResult struct {
-	ConfigPath string `json:"configPath"`
-	Current    string `json:"current"`
-	Proposed   string `json:"proposed"`
+type ToolGuide struct {
+	ToolName    string   `json:"toolName"`
+	DisplayName string   `json:"displayName"`
+	ConfigPath  string   `json:"configPath"`
+	Steps       []string `json:"steps"`
+	Snippet     string   `json:"snippet"`
 }
 
 type toolDef struct {
@@ -79,7 +78,7 @@ func findToolDef(name string) *toolDef {
 	return nil
 }
 
-func (m *Manager) PreviewApply(toolName string) (*DiffResult, error) {
+func (m *Manager) ToolGuide(toolName string) (*ToolGuide, error) {
 	td := findToolDef(toolName)
 	if td == nil {
 		return nil, fmt.Errorf("unknown tool %q", toolName)
@@ -87,215 +86,51 @@ func (m *Manager) PreviewApply(toolName string) (*DiffResult, error) {
 
 	home, _ := os.UserHomeDir()
 	configPath := filepath.Join(home, td.configRel)
-
-	// Read current file
-	current := ""
-	data, err := os.ReadFile(configPath)
-	if err == nil {
-		current = string(data)
+	var snippet string
+	steps := []string{
+		fmt.Sprintf("Open config file: %s", configPath),
+		"Add the MCP proxy entry shown below (merge with existing config; do not remove your other servers).",
+		"Save file and restart/reload the CLI tool.",
 	}
 
-	// Generate proposed
-	proposed, err := m.generateProposed(td, current)
-	if err != nil {
-		return nil, err
-	}
-
-	return &DiffResult{
-		ConfigPath: configPath,
-		Current:    current,
-		Proposed:   proposed,
-	}, nil
-}
-
-func (m *Manager) ApplyToTool(toolName string) error {
-	diff, err := m.PreviewApply(toolName)
-	if err != nil {
-		return err
-	}
-
-	dir := filepath.Dir(diff.ConfigPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("create dir: %w", err)
-	}
-
-	return os.WriteFile(diff.ConfigPath, []byte(diff.Proposed), 0644)
-}
-
-func (m *Manager) generateProposed(td *toolDef, current string) (string, error) {
 	switch td.format {
 	case "json-mcpServers":
-		return m.proposedJSONMcpServers(current)
+		snippet = `{
+  "mcpServers": {
+    "mcp-catalog-proxy": {
+      "type": "streamableHttp",
+      "url": "http://127.0.0.1:9847/mcp"
+    }
+  }
+}`
+		steps = append(steps,
+			"If URL transport is not supported by your client, use stdio variant instead:",
+			`"mcp-catalog-proxy": { "command": "/usr/local/bin/mcp-manager", "args": ["--mcp-stdio"] }`,
+		)
 	case "json-opencode":
-		return m.proposedJSONOpenCode(current)
+		snippet = `{
+  "mcp": {
+    "mcp-catalog-proxy": {
+      "type": "local",
+      "command": ["/usr/local/bin/mcp-manager", "--mcp-stdio"],
+      "enabled": true
+    }
+  }
+}`
 	case "toml-codex":
-		return m.proposedTOMLCodex(current)
+		snippet = `[mcp_servers.mcp-catalog-proxy]
+command = "/usr/local/bin/mcp-manager"
+args = ["--mcp-stdio"]
+`
 	default:
-		return "", fmt.Errorf("unsupported format %q", td.format)
-	}
-}
-
-// enabledServersClean returns enabled servers with the "enabled" field stripped.
-func (m *Manager) enabledServersClean() map[string]any {
-	cfg := m.store.Get()
-	result := make(map[string]any)
-	for name, srv := range cfg.MCPServers {
-		if !srv.Enabled {
-			continue
-		}
-		entry := make(map[string]any)
-		if srv.Type != "" {
-			entry["type"] = srv.Type
-		}
-		if srv.URL != "" {
-			entry["url"] = srv.URL
-		}
-		if srv.Command != "" {
-			entry["command"] = srv.Command
-		}
-		if len(srv.Args) > 0 {
-			entry["args"] = srv.Args
-		}
-		if len(srv.Env) > 0 {
-			entry["env"] = srv.Env
-		}
-		if len(entry) == 0 {
-			continue
-		}
-		result[name] = entry
-	}
-	return result
-}
-
-// JSON format with "mcpServers" key (Claude, Cursor, Gemini)
-func (m *Manager) proposedJSONMcpServers(current string) (string, error) {
-	var doc map[string]any
-
-	if current != "" {
-		if err := json.Unmarshal([]byte(current), &doc); err != nil {
-			// If current file is invalid JSON, start fresh
-			doc = make(map[string]any)
-		}
-	} else {
-		doc = make(map[string]any)
+		return nil, fmt.Errorf("unsupported format %q", td.format)
 	}
 
-	servers := m.enabledServersClean()
-
-	// Merge: keep existing servers not managed by us, add/overwrite ours
-	existing, _ := doc["mcpServers"].(map[string]any)
-	if existing == nil {
-		existing = make(map[string]any)
-	}
-	for name, srv := range servers {
-		existing[name] = srv
-	}
-	doc["mcpServers"] = existing
-
-	data, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return "", err
-	}
-	return string(data) + "\n", nil
-}
-
-// OpenCode JSON format with "mcp" key
-func (m *Manager) proposedJSONOpenCode(current string) (string, error) {
-	var doc map[string]any
-
-	if current != "" {
-		if err := json.Unmarshal([]byte(current), &doc); err != nil {
-			doc = make(map[string]any)
-		}
-	} else {
-		doc = make(map[string]any)
-	}
-
-	cfg := m.store.Get()
-	mcpSection := make(map[string]any)
-
-	// Preserve existing entries not managed by us
-	if existing, ok := doc["mcp"].(map[string]any); ok {
-		for k, v := range existing {
-			mcpSection[k] = v
-		}
-	}
-
-	for name, srv := range cfg.MCPServers {
-		if !srv.Enabled {
-			continue
-		}
-		if srv.Command == "" {
-			continue
-		}
-		cmd := []string{srv.Command}
-		cmd = append(cmd, srv.Args...)
-		entry := map[string]any{
-			"type":    "local",
-			"command": cmd,
-			"enabled": true,
-		}
-		mcpSection[name] = entry
-	}
-	doc["mcp"] = mcpSection
-
-	data, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return "", err
-	}
-	return string(data) + "\n", nil
-}
-
-// Codex TOML format with [mcp_servers.NAME] sections
-func (m *Manager) proposedTOMLCodex(current string) (string, error) {
-	cfg := m.store.Get()
-
-	// Remove existing [mcp_servers.*] sections from current
-	base := current
-	if base != "" {
-		re := regexp.MustCompile(`(?m)^\[mcp_servers\.[^\]]+\]\n(?:[^\[]*\n)*`)
-		base = re.ReplaceAllString(base, "")
-		base = strings.TrimRight(base, "\n\r\t ")
-	}
-
-	// Generate new [mcp_servers.*] sections
-	var sb strings.Builder
-	if base != "" {
-		sb.WriteString(base)
-		sb.WriteString("\n\n")
-	}
-
-	for name, srv := range cfg.MCPServers {
-		if !srv.Enabled {
-			continue
-		}
-		if srv.Command == "" {
-			continue
-		}
-		sb.WriteString(fmt.Sprintf("[mcp_servers.%s]\n", name))
-		sb.WriteString(fmt.Sprintf("command = %q\n", srv.Command))
-
-		// Format args as TOML array
-		sb.WriteString("args = [ ")
-		for i, arg := range srv.Args {
-			if i > 0 {
-				sb.WriteString(", ")
-			}
-			sb.WriteString(fmt.Sprintf("%q", arg))
-		}
-		sb.WriteString(" ]\n")
-
-		if len(srv.Env) > 0 {
-			sb.WriteString("[mcp_servers.")
-			sb.WriteString(name)
-			sb.WriteString(".env]\n")
-			for k, v := range srv.Env {
-				sb.WriteString(fmt.Sprintf("%s = %q\n", k, v))
-			}
-		}
-
-		sb.WriteString("\n")
-	}
-
-	return strings.TrimRight(sb.String(), "\n") + "\n", nil
+	return &ToolGuide{
+		ToolName:    td.name,
+		DisplayName: td.displayName,
+		ConfigPath:  configPath,
+		Steps:       steps,
+		Snippet:     snippet,
+	}, nil
 }

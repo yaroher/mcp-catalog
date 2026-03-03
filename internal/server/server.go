@@ -3,11 +3,13 @@ package server
 import (
 	"embed"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/naukograd-software/mcp-catalog/internal/config"
@@ -17,22 +19,70 @@ import (
 //go:embed all:static
 var staticFiles embed.FS
 
+const proxyServerName = "mcp-catalog-proxy"
+
 type Server struct {
 	store    *config.Store
 	mgr      *manager.Manager
-	clients  map[*websocket.Conn]bool
+	clients  map[*websocket.Conn]*wsClient
 	mu       sync.RWMutex
+	proxyMu  sync.RWMutex
+	proxy    manager.ServerInfo
 	mcpMu    sync.RWMutex
 	mcpState map[string]*mcpSession
 	upgrader websocket.Upgrader
+}
+
+type wsClient struct {
+	conn *websocket.Conn
+	send chan []byte
+	mu   sync.Mutex
+	once sync.Once
+}
+
+func (c *wsClient) writeLoop() {
+	for msg := range c.send {
+		c.mu.Lock()
+		err := c.conn.WriteMessage(websocket.TextMessage, msg)
+		c.mu.Unlock()
+		if err != nil {
+			break
+		}
+	}
+	_ = c.close()
+}
+
+func (c *wsClient) writeText(msg []byte) error {
+	select {
+	case c.send <- msg:
+		return nil
+	default:
+		return fmt.Errorf("client buffer full")
+	}
+}
+
+func (c *wsClient) close() error {
+	var err error
+	c.once.Do(func() {
+		close(c.send)
+		c.mu.Lock()
+		err = c.conn.Close()
+		c.mu.Unlock()
+	})
+	return err
 }
 
 func New(store *config.Store, mgr *manager.Manager) *Server {
 	s := &Server{
 		store:    store,
 		mgr:      mgr,
-		clients:  make(map[*websocket.Conn]bool),
+		clients:  make(map[*websocket.Conn]*wsClient),
 		mcpState: make(map[string]*mcpSession),
+		proxy: manager.ServerInfo{
+			Name:   proxyServerName,
+			Status: manager.StatusHealthy,
+			Logs:   []manager.LogEntry{},
+		},
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
@@ -95,6 +145,7 @@ func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	info := s.mgr.GetAllInfo()
+	info[proxyServerName] = s.proxyServerInfo(r.Host)
 	writeJSON(w, info)
 }
 
@@ -106,6 +157,23 @@ func (s *Server) handleServer(w http.ResponseWriter, r *http.Request) {
 	action := ""
 	if len(parts) > 1 {
 		action = parts[1]
+	}
+
+	if name == proxyServerName {
+		switch r.Method {
+		case "GET":
+			writeJSON(w, s.proxyServerInfo(r.Host))
+		case "POST":
+			if action != "check" {
+				http.Error(w, "unknown action", 400)
+				return
+			}
+			go s.checkProxy(r.Host)
+			writeJSON(w, map[string]string{"status": "ok"})
+		default:
+			http.Error(w, "system proxy entry is read-only", http.StatusMethodNotAllowed)
+		}
+		return
 	}
 
 	switch r.Method {
@@ -217,7 +285,7 @@ func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, tools)
 }
 
-// /api/tools/{name}/diff, /api/tools/{name}/apply
+// /api/tools/{name}/guide
 func (s *Server) handleToolAction(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/tools/")
 	parts := strings.SplitN(path, "/", 2)
@@ -228,28 +296,17 @@ func (s *Server) handleToolAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch action {
-	case "diff":
+	case "guide":
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", 405)
 			return
 		}
-		diff, err := s.mgr.PreviewApply(name)
+		guide, err := s.mgr.ToolGuide(name)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		writeJSON(w, diff)
-
-	case "apply":
-		if r.Method != "POST" {
-			http.Error(w, "method not allowed", 405)
-			return
-		}
-		if err := s.mgr.ApplyToTool(name); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		writeJSON(w, map[string]string{"status": "ok"})
+		writeJSON(w, guide)
 
 	default:
 		http.Error(w, "unknown action", 400)
@@ -290,17 +347,29 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	s.clients[conn] = true
-	s.mu.Unlock()
+	client := &wsClient{
+		conn: conn,
+		send: make(chan []byte, 256),
+	}
+	go client.writeLoop()
+
+	s.addClient(client)
+	defer func() {
+		if c := s.removeClient(conn); c != nil {
+			_ = c.close()
+		}
+	}()
 
 	// Send initial state
 	info := s.mgr.GetAllInfo()
+	info[proxyServerName] = s.proxyServerInfo(r.Host)
 	msg, _ := json.Marshal(map[string]interface{}{
 		"type":    "initial",
 		"servers": info,
 	})
-	conn.WriteMessage(websocket.TextMessage, msg)
+	if err := client.writeText(msg); err != nil {
+		return
+	}
 
 	// Read loop (keep alive)
 	for {
@@ -309,11 +378,157 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+}
 
-	s.mu.Lock()
-	delete(s.clients, conn)
-	s.mu.Unlock()
-	conn.Close()
+func (s *Server) proxyServerInfo(host string) *manager.ServerInfo {
+	if strings.TrimSpace(host) == "" {
+		host = "127.0.0.1:9847"
+	}
+	tools, _ := s.aggregateTools()
+	prompts, _ := s.aggregatePrompts()
+	resources, _ := s.aggregateResources()
+
+	outTools := make([]manager.MCPTool, 0, len(tools))
+	for _, t := range tools {
+		outTools = append(outTools, manager.MCPTool{
+			Name:        t.Name,
+			Description: t.Description,
+			InputSchema: t.InputSchema,
+		})
+	}
+
+	outPrompts := make([]manager.MCPPrompt, 0, len(prompts))
+	for _, p := range prompts {
+		name, _ := p["name"].(string)
+		desc, _ := p["description"].(string)
+		if name == "" {
+			continue
+		}
+		outPrompts = append(outPrompts, manager.MCPPrompt{
+			Name:        name,
+			Description: desc,
+		})
+	}
+
+	outResources := make([]manager.MCPResource, 0, len(resources))
+	for _, r := range resources {
+		uri, _ := r["uri"].(string)
+		name, _ := r["name"].(string)
+		desc, _ := r["description"].(string)
+		mimeType, _ := r["mimeType"].(string)
+		if uri == "" {
+			continue
+		}
+		outResources = append(outResources, manager.MCPResource{
+			Name:        name,
+			URI:         uri,
+			Description: desc,
+			MimeType:    mimeType,
+		})
+	}
+
+	s.proxyMu.RLock()
+	state := s.proxy
+	s.proxyMu.RUnlock()
+
+	return &manager.ServerInfo{
+		Name:    proxyServerName,
+		Virtual: true,
+		Config: config.MCPServer{
+			Type:    "streamableHttp",
+			URL:     fmt.Sprintf("http://%s/mcp", host),
+			Command: "/usr/local/bin/mcp-manager",
+			Args:    []string{"--mcp-stdio"},
+			Enabled: true,
+		},
+		Status:          state.Status,
+		Error:           state.Error,
+		Logs:            append([]manager.LogEntry{}, state.Logs...),
+		Tools:           outTools,
+		Prompts:         outPrompts,
+		Resources:       outResources,
+		LastCheck:       state.LastCheck,
+		CheckDuration:   state.CheckDuration,
+		ServerName:      "mcp-catalog-proxy",
+		ServerVersion:   "1.0.0",
+		ProtocolVersion: "2024-11-05",
+	}
+}
+
+func (s *Server) checkProxy(host string) {
+	start := time.Now()
+	info := s.proxyServerInfo(host)
+	info.Status = manager.StatusChecking
+	info.Error = ""
+	info.Logs = append(info.Logs, manager.LogEntry{
+		Time:    time.Now(),
+		Level:   "info",
+		Message: "Checking aggregated proxy backends",
+	})
+	s.setProxyState(info)
+
+	cfg := s.store.Get()
+	enabled := 0
+	okCount := 0
+	var failures []string
+	for name, srv := range cfg.MCPServers {
+		if srv == nil || !srv.Enabled {
+			continue
+		}
+		enabled++
+		if _, err := s.forwardMCP(name, srv, "tools/list", map[string]any{}); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", name, err))
+			continue
+		}
+		okCount++
+	}
+
+	now := time.Now()
+	info = s.proxyServerInfo(host)
+	info.LastCheck = &now
+	info.CheckDuration = time.Since(start).Milliseconds()
+	if enabled > 0 && okCount == 0 {
+		info.Status = manager.StatusError
+		if len(failures) > 0 {
+			info.Error = strings.Join(failures, " | ")
+		} else {
+			info.Error = "no reachable upstream MCP servers"
+		}
+		info.Logs = append(info.Logs, manager.LogEntry{
+			Time:    time.Now(),
+			Level:   "error",
+			Message: info.Error,
+		})
+	} else {
+		info.Status = manager.StatusHealthy
+		info.Error = ""
+		msg := fmt.Sprintf("Proxy check OK: %d/%d upstream servers reachable", okCount, enabled)
+		info.Logs = append(info.Logs, manager.LogEntry{
+			Time:    time.Now(),
+			Level:   "info",
+			Message: msg,
+		})
+	}
+	s.setProxyState(info)
+}
+
+func (s *Server) setProxyState(info *manager.ServerInfo) {
+	if info == nil {
+		return
+	}
+	s.proxyMu.Lock()
+	s.proxy.Status = info.Status
+	s.proxy.Error = info.Error
+	s.proxy.LastCheck = info.LastCheck
+	s.proxy.CheckDuration = info.CheckDuration
+	s.proxy.Logs = append([]manager.LogEntry{}, info.Logs...)
+	s.proxyMu.Unlock()
+
+	s.broadcast(map[string]interface{}{
+		"type":   "server_update",
+		"name":   proxyServerName,
+		"server": info,
+	})
 }
 
 func (s *Server) broadcast(data interface{}) {
@@ -322,19 +537,37 @@ func (s *Server) broadcast(data interface{}) {
 		return
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	for conn := range s.clients {
-		if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-			conn.Close()
-			go func(c *websocket.Conn) {
-				s.mu.Lock()
-				delete(s.clients, c)
-				s.mu.Unlock()
-			}(conn)
+	for _, client := range s.snapshotClients() {
+		if err := client.writeText(msg); err != nil {
+			if c := s.removeClient(client.conn); c != nil {
+				_ = c.close()
+			}
 		}
 	}
+}
+
+func (s *Server) addClient(client *wsClient) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clients[client.conn] = client
+}
+
+func (s *Server) removeClient(conn *websocket.Conn) *wsClient {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	client := s.clients[conn]
+	delete(s.clients, conn)
+	return client
+}
+
+func (s *Server) snapshotClients() []*wsClient {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*wsClient, 0, len(s.clients))
+	for _, client := range s.clients {
+		out = append(out, client)
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

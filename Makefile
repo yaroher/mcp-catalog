@@ -1,35 +1,47 @@
-.PHONY: build install uninstall run clean
+.PHONY: build rebuild install uninstall run clean
 
 BINARY=mcp-manager
 BUILD_DIR=./build
+USER_BIN_DIR=$(HOME)/.local/bin
+USER_SYSTEMD_DIR=$(HOME)/.config/systemd/user
+USER_CONFIG_DIR=$(HOME)/.config/mcp-manager
+USER_SERVICE=$(USER_SYSTEMD_DIR)/mcp-manager.service
 
 build:
 	go build -o $(BUILD_DIR)/$(BINARY) ./cmd/mcp-manager
 
+rebuild: clean
+	mkdir -p $(BUILD_DIR)
+	go build -a -o $(BUILD_DIR)/$(BINARY) ./cmd/mcp-manager
+
 run: build
 	$(BUILD_DIR)/$(BINARY) --port 9847
 
-# Install or reinstall system-wide (requires sudo)
-install: build
-	sudo install -m 0755 $(BUILD_DIR)/$(BINARY) /usr/local/bin/$(BINARY)
-	sudo install -m 0644 mcp-manager.service /etc/systemd/system/mcp-manager.service
-	sudo systemctl daemon-reload
-	@if sudo systemctl is-active --quiet mcp-manager; then \
-		sudo systemctl restart mcp-manager; \
-		echo "Restarted mcp-manager"; \
-	fi
+# Install or reinstall for current user (no sudo required)
+install: rebuild
+	mkdir -p $(USER_BIN_DIR)
+	install -m 0755 $(BUILD_DIR)/$(BINARY) $(USER_BIN_DIR)/$(BINARY)
+	mkdir -p $(USER_SYSTEMD_DIR)
+	install -m 0644 mcp-manager.service $(USER_SERVICE)
+	rm -f $(HOME)/.config/systemd/user/multi-user.target.wants/mcp-manager.service
+	mkdir -p $(USER_CONFIG_DIR)
+	test -f $(USER_CONFIG_DIR)/config.json || printf '{\n  "mcpServers": {}\n}\n' > $(USER_CONFIG_DIR)/config.json
+	systemctl --user daemon-reload
+	systemctl --user enable --now mcp-manager
+	systemctl --user restart mcp-manager
 	@echo ""
-	@echo "Installed/Reinstalled! Enable with:"
-	@echo "  sudo systemctl enable --now mcp-manager"
+	@echo "Installed/Reinstalled for user!"
+	@echo "Service:"
+	@echo "  systemctl --user status mcp-manager"
 	@echo ""
 	@echo "UI available at: http://localhost:9847"
 
 uninstall:
-	-sudo systemctl stop mcp-manager
-	-sudo systemctl disable mcp-manager
-	-sudo rm -f /usr/local/bin/$(BINARY)
-	-sudo rm -f /etc/systemd/system/mcp-manager.service
-	-sudo rm -f /etc/systemd/system/mcp-manager@.service
+	-systemctl --user stop mcp-manager
+	-systemctl --user disable mcp-manager
+	-rm -f $(USER_BIN_DIR)/$(BINARY)
+	-rm -f $(USER_SERVICE)
+	-systemctl --user daemon-reload
 
 clean:
 	rm -rf $(BUILD_DIR)

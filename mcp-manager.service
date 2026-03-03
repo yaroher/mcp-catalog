@@ -4,9 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/mcp-manager --port 9847 --config /etc/mcp-manager/config.json
+ExecStart=%h/.local/bin/mcp-manager --port 9847 --config %h/.config/mcp-manager/config.json
 Restart=on-failure
 RestartSec=5
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

@@ -16,6 +16,7 @@ import (
 )
 
 func main() {
+	log.SetOutput(os.Stderr)
 	port := flag.Int("port", 9847, "HTTP port")
 	configPath := flag.String("config", "", "Config file path (default: ~/.config/mcp-manager/config.json)")
 	mcpStdio := flag.Bool("mcp-stdio", false, "Run as MCP proxy over stdio")

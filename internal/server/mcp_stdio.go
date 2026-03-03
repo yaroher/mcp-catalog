@@ -14,7 +14,8 @@ import (
 // RunMCPStdio starts the MCP proxy transport over stdio.
 func RunMCPStdio(store *config.Store) error {
 	mgr := manager.New(store)
-	go mgr.CheckAll()
+	// Start discovery and wait for it to complete
+	mgr.CheckAll()
 	go mgr.StartHealthLoop()
 
 	s := &Server{
@@ -98,9 +99,12 @@ func (s *Server) runMCPStdio() error {
 			var res json.RawMessage
 			var err error
 			if route.ServerName == "system" {
-				res, err = s.invokeSystemTool(route.ToolName, p.Arguments)
+				res, err = s.invokeSystemTool(route.ToolName, p.Arguments, "")
 			} else {
 				res, err = s.callTool(route.ServerName, route.ToolName, p.Arguments)
+				if err == nil {
+					res = s.enhanceToolResult(res, route.ServerName)
+				}
 			}
 			if err != nil {
 				_ = write(rpcResp{JSONRPC: "2.0", ID: req.ID, Error: &rpcErr{Code: -32000, Message: err.Error()}})

@@ -70,7 +70,7 @@ sudo systemctl enable --now mcp-manager
 | `/api/config` | GET | Полный конфиг |
 | `/api/config/export` | GET | Скачать конфиг как файл |
 | `/api/config/import` | POST | Импортировать конфиг |
-| `/api/apply/{tool}` | GET | Конфиг для CLI (claude/codex/gemini/kilo/antygravity/open-code) |
+| `/api/tools/{name}/guide` | GET | Инструкция как добавить MCP proxy в конкретный CLI |
 | `/ws` | WS | Real-time обновления |
 
 ## Как это работает

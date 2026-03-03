@@ -135,6 +135,26 @@
     color: var(--text-dim);
   }
 
+  .sidebar-group {
+    border-bottom: 1px solid var(--border);
+  }
+
+  .sidebar-group-header {
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: rgba(255,255,255,0.01);
+  }
+
+  .sidebar-group-header h4 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--text-dim);
+  }
+
   .server-item {
     padding: 14px 16px;
     border-bottom: 1px solid var(--border);
@@ -612,7 +632,7 @@
   </div>
   <div class="topbar-actions">
     <button class="btn" onclick="showSettingsModal()">⚙ Settings</button>
-    <button class="btn" onclick="showApplyModal()">⚡ Apply to CLI</button>
+      <button class="btn" onclick="showApplyModal()">⚡ CLI Setup Guide</button>
     <button class="btn" onclick="exportConfig()">↓ Export</button>
     <button class="btn" onclick="showImportModal()">↑ Import</button>
     <button class="btn primary" onclick="showAddModal()">+ Add Server</button>
@@ -621,11 +641,20 @@
 
 <div class="layout">
   <div class="sidebar">
-    <div class="sidebar-header">
-      <h3>MCP Servers</h3>
-      <span id="serverCount" style="font-family:'JetBrains Mono';font-size:11px;color:var(--text-dim)">0</span>
+    <div class="sidebar-group">
+      <div class="sidebar-group-header">
+        <h4>Proxy</h4>
+        <span id="proxyCount" style="font-family:'JetBrains Mono';font-size:11px;color:var(--text-dim)">0</span>
+      </div>
+      <div id="proxyList"></div>
     </div>
-    <div id="serverList"></div>
+    <div class="sidebar-group">
+      <div class="sidebar-group-header">
+        <h4>MCP Servers</h4>
+        <span id="serverCount" style="font-family:'JetBrains Mono';font-size:11px;color:var(--text-dim)">0</span>
+      </div>
+      <div id="serverList"></div>
+    </div>
   </div>
   <div class="main" id="mainContent">
     <div class="empty-state">
@@ -722,24 +751,24 @@
 <!-- Apply Modal -->
 <div id="applyModal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeModal('applyModal')">
   <div class="modal" style="max-width:1100px">
-    <h2>Apply to CLI Tool</h2>
+    <h2>CLI Setup Guide</h2>
     <div id="applyToolsGrid" class="apply-grid">
       Loading...
     </div>
     <div id="applyDiffContainer" style="display:none">
       <div class="diff-container">
         <div class="diff-pane">
-          <div class="diff-header" id="diffCurrentHeader">Current</div>
+          <div class="diff-header" id="diffCurrentHeader">How to apply</div>
           <pre class="diff-code" id="diffCurrentCode"></pre>
         </div>
         <div class="diff-pane">
-          <div class="diff-header diff-header-new">Proposed</div>
+          <div class="diff-header diff-header-new">Config snippet</div>
           <pre class="diff-code" id="diffProposedCode"></pre>
         </div>
       </div>
       <div class="form-actions" style="margin-top:16px">
         <button class="btn" onclick="closeModal('applyModal')">Close</button>
-        <button class="btn primary" id="applyBtn" onclick="applyToTool()">Apply</button>
+        <button class="btn primary" onclick="copyGuideSnippet()">Copy Snippet</button>
       </div>
     </div>
   </div>
@@ -831,11 +860,17 @@
 
   // Render server list
   function renderServerList() {
-    const el = document.getElementById('serverList');
-    const names = Object.keys(servers).sort();
-    document.getElementById('serverCount').textContent = names.length;
+    const serverListEl = document.getElementById('serverList');
+    const proxyListEl = document.getElementById('proxyList');
+    const names = Object.keys(servers).sort((a, b) => {
+      return a.localeCompare(b);
+    });
+    const proxyNames = names.filter(n => servers[n] && servers[n].virtual);
+    const serverNames = names.filter(n => !servers[n] || !servers[n].virtual);
+    document.getElementById('proxyCount').textContent = proxyNames.length;
+    document.getElementById('serverCount').textContent = serverNames.length;
 
-    el.innerHTML = names.map(name => {
+    const renderItems = list => list.map(name => {
       const s = servers[name];
       const active = selectedServer === name ? 'active' : '';
       const toolCount = s.tools ? s.tools.length : 0;
@@ -854,6 +889,9 @@
         </div>
       `;
     }).join('');
+
+    proxyListEl.innerHTML = renderItems(proxyNames) || `<div class="server-meta" style="padding:12px 16px">No proxy entry</div>`;
+    serverListEl.innerHTML = renderItems(serverNames) || `<div class="server-meta" style="padding:12px 16px">No MCP servers</div>`;
   }
 
   // Select server
@@ -867,6 +905,7 @@
   function renderDetail(name) {
     const s = servers[name];
     if (!s) return;
+    const isVirtual = !!s.virtual;
 
     const main = document.getElementById('mainContent');
     const lastCheck = s.lastCheck ? new Date(s.lastCheck).toLocaleString() : '—';
@@ -876,6 +915,22 @@
     const checking = s.status === 'checking';
     const serverLabel = s.serverName ? `${s.serverName}${s.serverVersion ? ' v' + s.serverVersion : ''}` : '—';
     const duration = s.checkDuration ? s.checkDuration + 'ms' : '—';
+    const proxyHttpSnippet = `{
+  "mcpServers": {
+    "mcp-catalog-proxy": {
+      "type": "streamableHttp",
+      "url": "${s.config.url || (location.origin + '/mcp')}"
+    }
+  }
+}`;
+    const proxyStdioSnippet = `{
+  "mcpServers": {
+    "mcp-catalog-proxy": {
+      "command": "${s.config.command || '/usr/local/bin/mcp-manager'}",
+      "args": ["--mcp-stdio"]
+    }
+  }
+}`;
 
     main.innerHTML = `
       <div class="detail-header">
@@ -883,11 +938,18 @@
           <div class="detail-title">${name}</div>
         </div>
         <div class="detail-actions">
+          ${isVirtual ? `
+          <button class="btn primary" onclick="checkServer('${name}')" ${checking ? 'disabled' : ''}>
+            ${checking ? '↻ Checking...' : '↻ Check'}
+          </button>
+          <span style="font-size:12px;color:var(--text-dim)">System MCP proxy (read-only config)</span>
+          ` : `
           <button class="btn primary" onclick="checkServer('${name}')" ${checking ? 'disabled' : ''}>
             ${checking ? '↻ Checking...' : '↻ Check'}
           </button>
           <button class="btn" onclick="editServer('${name}')">✎ Edit</button>
           <button class="btn danger" onclick="deleteServer('${name}')">✕ Delete</button>
+          `}
         </div>
       </div>
 
@@ -950,6 +1012,22 @@
           </div>
         </div>
       </div>
+
+      ${isVirtual ? `
+      <div class="section">
+        <div class="section-title">How to Connect</div>
+        <div class="tools-grid">
+          <div class="tool-card">
+            <div class="tool-name">streamableHttp (recommended)</div>
+            <pre class="diff-code" style="max-height:220px">${escapeHtml(proxyHttpSnippet)}</pre>
+          </div>
+          <div class="tool-card">
+            <div class="tool-name">STDIO</div>
+            <pre class="diff-code" style="max-height:220px">${escapeHtml(proxyStdioSnippet)}</pre>
+          </div>
+        </div>
+      </div>
+      ` : ``}
 
       ${s.tools && s.tools.length > 0 ? `
       <div class="section">
@@ -1270,27 +1348,24 @@
     document.getElementById('diffProposedCode').textContent = 'Loading...';
 
     try {
-      const diff = await api('GET', `/api/tools/${name}/diff`);
+      const guide = await api('GET', `/api/tools/${name}/guide`);
       document.getElementById('diffCurrentHeader').textContent =
-        'Current: ' + diff.configPath;
-      document.getElementById('diffCurrentCode').textContent =
-        diff.current || '(file does not exist)';
+        'How to apply: ' + guide.configPath;
+      const steps = (guide.steps || []).map((s, i) => `${i + 1}. ${s}`).join('\n');
+      document.getElementById('diffCurrentCode').textContent = steps || 'No instructions';
       document.getElementById('diffProposedCode').textContent =
-        diff.proposed;
+        guide.snippet || '';
     } catch (e) {
       document.getElementById('diffCurrentCode').textContent = 'Error: ' + e.message;
       document.getElementById('diffProposedCode').textContent = '';
     }
   }
 
-  async function applyToTool() {
-    if (!selectedApplyTool) return;
-    try {
-      await api('POST', `/api/tools/${selectedApplyTool}/apply`);
-      toast('Applied to ' + selectedApplyTool);
-      // Refresh diff to show updated current
-      selectApplyTool(selectedApplyTool);
-    } catch (e) { toast('Error: ' + e.message); }
+  function copyGuideSnippet() {
+    const text = document.getElementById('diffProposedCode').textContent;
+    if (!text) return;
+    navigator.clipboard.writeText(text);
+    toast('Snippet copied');
   }
 
   // Utils

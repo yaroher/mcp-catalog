@@ -33,6 +33,7 @@ type LogEntry struct {
 
 type ServerInfo struct {
 	Name            string           `json:"name"`
+	Virtual         bool             `json:"virtual,omitempty"`
 	Config          config.MCPServer `json:"config"`
 	Status          ServerStatus     `json:"status"`
 	Error           string           `json:"error,omitempty"`
@@ -725,14 +726,20 @@ func closeStreamableHTTPSession(client *http.Client, url, sessionID string) erro
 	return nil
 }
 
-// CheckAll checks all enabled servers.
+// CheckAll checks all enabled servers in parallel.
 func (m *Manager) CheckAll() {
 	cfg := m.store.Get()
+	var wg sync.WaitGroup
 	for name, srv := range cfg.MCPServers {
 		if srv.Enabled {
-			m.Check(name)
+			wg.Add(1)
+			go func(n string) {
+				defer wg.Done()
+				m.Check(n)
+			}(name)
 		}
 	}
+	wg.Wait()
 }
 
 // StartHealthLoop runs periodic health checks in background.
