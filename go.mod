@@ -1,4 +1,4 @@
-module github.com/naukograd-software/mcp-catalog
+module github.com/yaroher/mcp-catalog
 
 go 1.21
 

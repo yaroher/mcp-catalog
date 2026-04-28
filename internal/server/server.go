@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/naukograd-software/mcp-catalog/internal/config"
-	"github.com/naukograd-software/mcp-catalog/internal/manager"
+	"github.com/yaroher/mcp-catalog/internal/config"
+	"github.com/yaroher/mcp-catalog/internal/manager"
 )
 
 //go:embed all:static

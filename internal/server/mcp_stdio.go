@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/naukograd-software/mcp-catalog/internal/config"
-	"github.com/naukograd-software/mcp-catalog/internal/manager"
+	"github.com/yaroher/mcp-catalog/internal/config"
+	"github.com/yaroher/mcp-catalog/internal/manager"
 )
 
 // RunMCPStdio starts the MCP proxy transport over stdio.

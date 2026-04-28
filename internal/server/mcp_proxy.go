@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/naukograd-software/mcp-catalog/internal/config"
+	"github.com/yaroher/mcp-catalog/internal/config"
 )
 
 const proxyProtocolVersion = "2024-11-05"

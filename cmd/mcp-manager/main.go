@@ -10,9 +10,9 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/naukograd-software/mcp-catalog/internal/config"
-	"github.com/naukograd-software/mcp-catalog/internal/manager"
-	"github.com/naukograd-software/mcp-catalog/internal/server"
+	"github.com/yaroher/mcp-catalog/internal/config"
+	"github.com/yaroher/mcp-catalog/internal/manager"
+	"github.com/yaroher/mcp-catalog/internal/server"
 )
 
 func main() {

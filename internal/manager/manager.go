@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/naukograd-software/mcp-catalog/internal/config"
+	"github.com/yaroher/mcp-catalog/internal/config"
 )
 
 type ServerStatus string
